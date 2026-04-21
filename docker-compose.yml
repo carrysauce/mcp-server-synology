@@ -1,19 +1,25 @@
 services:
-  # Synology MCP Server with optional Xiaozhi support
+  # Synology MCP Server
   # Configure via ~/.config/synology-mcp/settings.json
   synology-mcp:
     build: .
     container_name: synology-mcp-server
     command: ["python", "main.py"]
-    network_mode: host  # Allow access to local network (192.168.x.x)
     environment:
       - XDG_CONFIG_HOME=/home/mcpuser/.config
+      - TRANSPORT=${TRANSPORT:-stdio}
+      - HTTP_HOST=${HTTP_HOST:-0.0.0.0}
+      - HTTP_PORT=${HTTP_PORT:-8765}
+      - HTTP_PATH=${HTTP_PATH:-/mcp}
+      - HTTP_QUERY_TOKEN=${HTTP_QUERY_TOKEN:-}
     volumes:
       - ./logs:/app/logs
       # Mount XDG config directory for settings.json
       # On macOS: ~/.config/synology-mcp -> /home/mcpuser/.config/synology-mcp
       # On Linux: ~/.config/synology-mcp -> /home/mcpuser/.config/synology-mcp
       - ${XDG_CONFIG_HOME:-$HOME/.config}/synology-mcp:/home/mcpuser/.config/synology-mcp:ro
+    ports:
+      - "${HTTP_PORT:-8765}:${HTTP_PORT:-8765}"
     stdin_open: true
     tty: true
     restart: unless-stopped

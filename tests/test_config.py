@@ -7,12 +7,31 @@ from pathlib import Path
 from unittest.mock import patch
 
 
-# Force reimport of config module to avoid cached global instance
-def reload_config():
+def reload_config_module():
     """Reload the config module to get fresh state."""
-    modules_to_remove = [k for k in sys.modules.keys() if k.startswith("config")]
-    for mod in modules_to_remove:
-        del sys.modules[mod]
+    for module_name in list(sys.modules):
+        if module_name == "config":
+            del sys.modules[module_name]
+
+
+def load_config(env=None, settings_data=None, tmp_path=None, permissions=0o600):
+    """Load a fresh SynologyConfig with optional env vars and settings.json."""
+    reload_config_module()
+    env = env or {}
+
+    with patch.dict(os.environ, env, clear=True):
+        import config as config_module
+
+        settings_file = Path("/nonexistent/settings.json")
+        if settings_data is not None:
+            if tmp_path is None:
+                raise ValueError("tmp_path is required when settings_data is provided")
+            settings_file = tmp_path / "settings.json"
+            settings_file.write_text(json.dumps(settings_data))
+            os.chmod(settings_file, permissions)
+
+        with patch.object(config_module, "SETTINGS_FILE", settings_file):
+            return config_module.SynologyConfig()
 
 
 class TestSynologyConfig:
@@ -20,283 +39,229 @@ class TestSynologyConfig:
 
     def test_env_fallback(self):
         """Test that .env values are used as fallback."""
-        # Clear any cached config
-        reload_config()
-
-        with patch.dict(
-            os.environ,
+        cfg = load_config(
             {
                 "SYNOLOGY_URL": "http://test.local:5000",
                 "SYNOLOGY_USERNAME": "testuser",
                 "SYNOLOGY_PASSWORD": "testpass",
-            },
-        ):
-            with patch("config.SECRETS_FILE", Path("/nonexistent/secrets.json")):
-                with patch.object(Path, "exists", return_value=False):
-                    from config import SynologyConfig
+            }
+        )
 
-                    config = SynologyConfig()
-
-                    assert config.synology_url == "http://test.local:5000"
-                    assert config.synology_username == "testuser"
-                    assert config.synology_password == "testpass"
+        assert cfg.synology_url == "http://test.local:5000"
+        assert cfg.synology_username == "testuser"
+        assert cfg.synology_password == "testpass"
 
     def test_default_values(self):
         """Test default configuration values."""
-        reload_config()
+        cfg = load_config()
 
-        with patch.dict(os.environ, {}, clear=True):
-            with patch("config.SECRETS_FILE", Path("/nonexistent/secrets.json")):
-                with patch.object(Path, "exists", return_value=False):
-                    from config import SynologyConfig
+        assert cfg.server_name == "synology-mcp-server"
+        assert cfg.server_version == "1.0.0"
+        assert cfg.default_session_timeout == 3600
+        assert cfg.auto_login is True
+        assert cfg.verify_ssl is False
+        assert cfg.transport == "stdio"
+        assert cfg.http_host == "0.0.0.0"
+        assert cfg.http_port == 8765
+        assert cfg.http_path == "/mcp"
+        assert cfg.http_query_token is None
 
-                    config = SynologyConfig()
-
-                    assert config.server_name == "synology-mcp-server"
-                    assert config.server_version == "1.0.0"
-                    assert config.default_session_timeout == 3600
-                    assert config.auto_login is True
-                    assert config.verify_ssl is False
-
-    def test_has_credentials_with_secrets(self, tmp_path):
-        """Test credential detection with secrets.json."""
-        secrets_data = {
-            "synology": {
-                "test_nas": {
-                    "host": "192.168.1.100",
-                    "port": 5000,
-                    "username": "admin",
-                    "password": "pass123",
-                }
+    def test_http_env_values(self):
+        """Test HTTP transport env vars are loaded and normalized."""
+        cfg = load_config(
+            {
+                "TRANSPORT": "HTTP",
+                "HTTP_HOST": "127.0.0.1",
+                "HTTP_PORT": "9999",
+                "HTTP_PATH": "synology/",
+                "HTTP_QUERY_TOKEN": "secret-token",
             }
-        }
+        )
 
-        secrets_file = tmp_path / "secrets.json"
-        secrets_file.write_text(json.dumps(secrets_data))
+        assert cfg.transport == "http"
+        assert cfg.http_host == "127.0.0.1"
+        assert cfg.http_port == 9999
+        assert cfg.http_path == "/synology"
+        assert cfg.http_query_token == "secret-token"
 
-        reload_config()
+    def test_has_credentials_with_settings(self, tmp_path):
+        """Test credential detection with settings.json."""
+        cfg = load_config(
+            settings_data={
+                "synology": {
+                    "test_nas": {
+                        "host": "192.168.1.100",
+                        "port": 5000,
+                        "username": "admin",
+                        "password": "pass123",
+                    }
+                }
+            },
+            tmp_path=tmp_path,
+        )
 
-        with patch.dict(os.environ, {}, clear=True):
-            with patch("config.SECRETS_FILE", secrets_file):
-                from config import SynologyConfig
-
-                cfg = SynologyConfig()
-
-                assert cfg.has_synology_credentials() is True
-                assert "test_nas" in cfg.nas_configs
-                assert cfg.nas_configs["test_nas"]["base_url"] == "http://192.168.1.100:5000"
+        assert cfg.has_synology_credentials() is True
+        assert "test_nas" in cfg.nas_configs
+        assert cfg.nas_configs["test_nas"]["base_url"] == "http://192.168.1.100:5000"
 
     def test_get_nas_names(self, tmp_path):
-        """Test getting NAS names from secrets.json."""
-        secrets_data = {
-            "synology": {
-                "nas1": {"host": "192.168.1.1", "port": 5000, "username": "a", "password": "b"},
-                "nas2": {"host": "192.168.1.2", "port": 5001, "username": "c", "password": "d"},
-            }
-        }
+        """Test getting NAS names from settings.json."""
+        cfg = load_config(
+            settings_data={
+                "synology": {
+                    "nas1": {"host": "192.168.1.1", "port": 5000, "username": "a", "password": "b"},
+                    "nas2": {"host": "192.168.1.2", "port": 5001, "username": "c", "password": "d"},
+                }
+            },
+            tmp_path=tmp_path,
+        )
 
-        secrets_file = tmp_path / "secrets.json"
-        secrets_file.write_text(json.dumps(secrets_data))
-
-        reload_config()
-
-        with patch.dict(os.environ, {}, clear=True):
-            with patch("config.SECRETS_FILE", secrets_file):
-                from config import SynologyConfig
-
-                cfg = SynologyConfig()
-
-                names = cfg.get_nas_names()
-                assert len(names) == 2
-                assert "nas1" in names
-                assert "nas2" in names
+        names = cfg.get_nas_names()
+        assert len(names) == 2
+        assert "nas1" in names
+        assert "nas2" in names
 
     def test_get_synology_config_with_nas_name(self, tmp_path):
         """Test getting config for specific NAS."""
-        secrets_data = {
-            "synology": {
-                "primary": {
-                    "host": "192.168.1.100",
-                    "port": 5001,
-                    "username": "admin",
-                    "password": "secret",
+        cfg = load_config(
+            settings_data={
+                "synology": {
+                    "primary": {
+                        "host": "192.168.1.100",
+                        "port": 5001,
+                        "username": "admin",
+                        "password": "secret",
+                    }
                 }
-            }
-        }
+            },
+            tmp_path=tmp_path,
+        )
 
-        secrets_file = tmp_path / "secrets.json"
-        secrets_file.write_text(json.dumps(secrets_data))
-
-        reload_config()
-
-        with patch.dict(os.environ, {}, clear=True):
-            with patch("config.SECRETS_FILE", secrets_file):
-                from config import SynologyConfig
-
-                cfg = SynologyConfig()
-
-                specific = cfg.get_synology_config("primary")
-                assert specific["base_url"] == "https://192.168.1.100:5001"
-                assert specific["username"] == "admin"
+        specific = cfg.get_synology_config("primary")
+        assert specific["base_url"] == "https://192.168.1.100:5001"
+        assert specific["username"] == "admin"
 
     def test_validate_config_no_credentials(self):
         """Test validation fails with no credentials."""
-        reload_config()
+        cfg = load_config()
+        errors = cfg.validate_config()
 
-        with patch.dict(os.environ, {}, clear=True):
-            with patch("config.SECRETS_FILE", Path("/nonexistent/secrets.json")):
-                with patch.object(Path, "exists", return_value=False):
-                    from config import SynologyConfig
-
-                    cfg = SynologyConfig()
-
-                    errors = cfg.validate_config()
-                    assert len(errors) > 0
-                    assert "No Synology credentials" in errors[0]
+        assert len(errors) > 0
+        assert "No Synology credentials" in errors[0]
 
     def test_validate_config_timeout_too_low(self):
         """Test validation fails with low timeout."""
-        reload_config()
-
-        with patch.dict(
-            os.environ,
+        cfg = load_config(
             {
                 "SYNOLOGY_URL": "http://test.local:5000",
                 "SYNOLOGY_USERNAME": "user",
                 "SYNOLOGY_PASSWORD": "pass",
                 "SESSION_TIMEOUT": "30",
-            },
-            clear=False,
-        ):
-            with patch("config.SECRETS_FILE", Path("/nonexistent/secrets.json")):
-                with patch.object(Path, "exists", return_value=False):
-                    from config import SynologyConfig
-
-                    cfg = SynologyConfig()
-                    errors = cfg.validate_config()
-
-                    assert any("SESSION_TIMEOUT" in e for e in errors)
-
-    def test_missing_required_fields_in_secrets(self, tmp_path, capsys):
-        """Test handling of missing required fields in secrets."""
-        secrets_data = {
-            "synology": {
-                "incomplete_nas": {
-                    "host": "192.168.1.100"
-                    # missing username, password
-                }
             }
-        }
+        )
 
-        secrets_file = tmp_path / "secrets.json"
-        secrets_file.write_text(json.dumps(secrets_data))
+        errors = cfg.validate_config()
+        assert any("SESSION_TIMEOUT" in error for error in errors)
 
-        reload_config()
+    def test_validate_config_invalid_transport(self):
+        """Test validation fails with an invalid transport value."""
+        cfg = load_config(
+            {
+                "SYNOLOGY_URL": "http://test.local:5000",
+                "SYNOLOGY_USERNAME": "user",
+                "SYNOLOGY_PASSWORD": "pass",
+                "TRANSPORT": "websocket",
+            }
+        )
+
+        errors = cfg.validate_config()
+        assert any("TRANSPORT" in error for error in errors)
+
+    def test_validate_config_invalid_http_port(self):
+        """Test validation fails with an out-of-range HTTP port."""
+        cfg = load_config(
+            {
+                "SYNOLOGY_URL": "http://test.local:5000",
+                "SYNOLOGY_USERNAME": "user",
+                "SYNOLOGY_PASSWORD": "pass",
+                "HTTP_PORT": "70000",
+            }
+        )
+
+        errors = cfg.validate_config()
+        assert any("HTTP_PORT" in error for error in errors)
+
+    def test_missing_required_fields_in_settings(self, tmp_path):
+        """Test handling of missing required fields in settings."""
+        cfg = load_config(
+            settings_data={"synology": {"incomplete_nas": {"host": "192.168.1.100"}}},
+            tmp_path=tmp_path,
+        )
+
+        assert "incomplete_nas" not in cfg.nas_configs
+
+    def test_invalid_json_in_settings(self, tmp_path):
+        """Test handling of invalid JSON in settings file."""
+        reload_config_module()
 
         with patch.dict(os.environ, {}, clear=True):
-            with patch("config.SECRETS_FILE", secrets_file):
-                from config import SynologyConfig
+            import config as config_module
 
-                cfg = SynologyConfig()
+            settings_file = tmp_path / "settings.json"
+            settings_file.write_text("{ invalid json }")
+            os.chmod(settings_file, 0o600)
 
-                # Should not add incomplete NAS to configs
-                assert (
-                    "incomplete_nas" not in cfg.nas_configs
-                    or cfg.nas_configs.get("incomplete_nas") is None
-                )
+            with patch.object(config_module, "SETTINGS_FILE", settings_file):
+                cfg = config_module.SynologyConfig()
 
-    def test_invalid_json_in_secrets(self, tmp_path, capsys):
-        """Test handling of invalid JSON in secrets file."""
-        secrets_file = tmp_path / "secrets.json"
-        secrets_file.write_text("{ invalid json }")
-
-        reload_config()
-
-        with patch.dict(os.environ, {}, clear=True):
-            with patch("config.SECRETS_FILE", secrets_file):
-                from config import SynologyConfig
-
-                cfg = SynologyConfig()
-
-                # Should handle gracefully and not crash
-                assert cfg.nas_configs == {}
+        assert cfg.nas_configs == {}
 
     def test_resolve_base_url(self, tmp_path):
         """Test resolving base URL from NAS name."""
-        secrets_data = {
-            "synology": {
-                "office_nas": {
-                    "host": "office.example.com",
-                    "port": 5000,
-                    "username": "admin",
-                    "password": "pass",
+        cfg = load_config(
+            settings_data={
+                "synology": {
+                    "office_nas": {
+                        "host": "office.example.com",
+                        "port": 5000,
+                        "username": "admin",
+                        "password": "pass",
+                    }
                 }
-            }
-        }
+            },
+            tmp_path=tmp_path,
+        )
 
-        secrets_file = tmp_path / "secrets.json"
-        secrets_file.write_text(json.dumps(secrets_data))
-
-        reload_config()
-
-        with patch.dict(os.environ, {}, clear=True):
-            with patch("config.SECRETS_FILE", secrets_file):
-                from config import SynologyConfig
-
-                cfg = SynologyConfig()
-
-                url = cfg.resolve_base_url("office_nas")
-                assert url == "http://office.example.com:5000"
-
-                # Test non-existent NAS
-                url = cfg.resolve_base_url("nonexistent")
-                assert url is None
+        assert cfg.resolve_base_url("office_nas") == "http://office.example.com:5000"
+        assert cfg.resolve_base_url("nonexistent") is None
 
 
 class TestFilePermissions:
     """Test file permission checking."""
 
-    def test_permission_warning_for_open_permissions(self, tmp_path, capsys):
-        """Test that warning is printed for overly open permissions."""
-        # Create a file with open permissions
-        secrets_file = tmp_path / "secrets.json"
-        secrets_file.write_text("{}")
+    def test_permission_warning_for_open_permissions(self, tmp_path, caplog):
+        """Test that warning is logged for overly open permissions."""
+        cfg = load_config(
+            settings_data={"synology": {}},
+            tmp_path=tmp_path,
+            permissions=0o644,
+        )
 
-        # Make it world-readable
-        os.chmod(str(secrets_file), 0o644)
-
-        reload_config()
-
-        with patch.dict(os.environ, {}, clear=True):
-            with patch("config.SECRETS_FILE", secrets_file):
-                from config import SynologyConfig
-
-                _cfg = SynologyConfig()
-
-                # Should have printed a warning about permissions
-                captured = capsys.readouterr()
-                # Check for permission warning in stderr
-                assert "permission" in captured.err.lower() or "Warning" in captured.err
+        assert cfg.nas_configs == {}
+        assert "overly permissive permissions" in caplog.text
 
 
 def test_config_str_representation():
     """Test string representation of config."""
-    reload_config()
-
-    with patch.dict(
-        os.environ,
+    cfg = load_config(
         {
             "SYNOLOGY_URL": "http://test.local:5000",
             "SYNOLOGY_USERNAME": "user",
             "SYNOLOGY_PASSWORD": "pass",
-        },
-    ):
-        with patch("config.SECRETS_FILE", Path("/nonexistent/secrets.json")):
-            with patch.object(Path, "exists", return_value=False):
-                from config import SynologyConfig
+        }
+    )
 
-                cfg = SynologyConfig()
-                cfg_str = str(cfg)
-
-                assert "SynologyConfig" in cfg_str
-                assert "auto_login" in cfg_str
+    cfg_str = str(cfg)
+    assert "SynologyConfig" in cfg_str
+    assert "auto_login" in cfg_str
+    assert "transport" in cfg_str
