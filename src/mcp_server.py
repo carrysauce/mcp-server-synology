@@ -1,8 +1,11 @@
 # src/mcp_server.py - MCP Server for Synology NAS operations
 
 import asyncio
+import contextlib
+import hmac
 import json
 import logging
+from urllib.parse import parse_qs
 from typing import Dict
 
 import urllib3
@@ -13,7 +16,10 @@ import mcp.server.stdio
 import mcp.types as types
 from mcp.server import Server
 from mcp.server.lowlevel import NotificationOptions
-from mcp.server.models import InitializationOptions
+from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
+from starlette.applications import Starlette
+from starlette.responses import PlainTextResponse
+from starlette.routing import Route
 
 from auth import SynologyAuth
 from config import config
@@ -46,6 +52,76 @@ class SynologyMCPServer:
         self.usermgr_instances: Dict[str, SynologyUserManager] = {}
         self.nas_name_map: Dict[str, str] = {}  # nas_name -> base_url
         self._setup_handlers()
+
+    def _create_initialization_options(self):
+        """Create MCP initialization options for the current server."""
+        return self.server.create_initialization_options(
+            notification_options=NotificationOptions(),
+            experimental_capabilities={},
+        )
+
+    async def startup(self):
+        """Validate configuration and perform startup login."""
+        config_errors = config.validate_config()
+        if config_errors and config.auto_login:
+            error_msg = f"Configuration errors: {', '.join(config_errors)}"
+            logger.error(error_msg)
+            raise Exception(f"Invalid configuration - stopping server. {error_msg}")
+        if config.debug:
+            logger.debug(f"Configuration loaded: {config}")
+
+        logger.info("Attempting auto-login...")
+        await self._auto_login_if_configured()
+
+    def create_streamable_http_app(self) -> Starlette:
+        """Create a Streamable HTTP ASGI application."""
+        session_manager = StreamableHTTPSessionManager(app=self.server)
+        transport_app = StreamableHTTPASGIApp(session_manager)
+        if config.http_query_token:
+            transport_app = QueryTokenProtectedASGIApp(transport_app, config.http_query_token)
+
+        @contextlib.asynccontextmanager
+        async def lifespan(_app):
+            async with session_manager.run():
+                yield
+
+        return Starlette(
+            routes=[Route(config.http_path, endpoint=transport_app)],
+            lifespan=lifespan,
+            debug=config.debug,
+        )
+
+    async def serve_stdio(self):
+        """Serve the MCP server over stdio."""
+        logger.info("Starting MCP server on stdio...")
+        async with mcp.server.stdio.stdio_server() as (read_stream, write_stream):
+            await self.server.run(
+                read_stream,
+                write_stream,
+                self._create_initialization_options(),
+            )
+
+    async def serve_streamable_http(self):
+        """Serve the MCP server over streamable HTTP."""
+        import uvicorn
+
+        app = self.create_streamable_http_app()
+        if config.http_query_token:
+            logger.info("HTTP query token authentication is enabled")
+
+        logger.info(
+            "Starting MCP server on streamable HTTP at "
+            f"http://{config.http_host}:{config.http_port}{config.http_path}"
+        )
+        server = uvicorn.Server(
+            uvicorn.Config(
+                app,
+                host=config.http_host,
+                port=config.http_port,
+                log_level=config.log_level.lower(),
+            )
+        )
+        await server.serve()
 
     def _get_filestation(self, base_url: str) -> SynologyFileStation:
         """Get or create FileStation instance for a base URL."""
@@ -2114,35 +2190,15 @@ class SynologyMCPServer:
 
     async def run(self):
         """Run the MCP server."""
-        # Validate configuration first
-        config_errors = config.validate_config()
-        if config_errors and config.auto_login:
-            error_msg = f"Configuration errors: {', '.join(config_errors)}"
-            logger.error(error_msg)
-            raise Exception(f"Invalid configuration - stopping server. {error_msg}")
-        elif config.debug:
-            logger.debug(f"Configuration loaded: {config}")
-
-        # Attempt auto-login if configured (this will raise exception on failure and stop server)
-        logger.info("Attempting auto-login...")
-        await self._auto_login_if_configured()
-
-        # Only start server if auto-login succeeded (or wasn't required)
         try:
-            logger.info("Starting MCP server on stdio...")
-            async with mcp.server.stdio.stdio_server() as (read_stream, write_stream):
-                await self.server.run(
-                    read_stream,
-                    write_stream,
-                    InitializationOptions(
-                        server_name=config.server_name,
-                        server_version=config.server_version,
-                        capabilities=self.server.get_capabilities(
-                            notification_options=NotificationOptions(),
-                            experimental_capabilities={},
-                        ),
-                    ),
-                )
+            await self.startup()
+
+            if config.transport == "http":
+                await self.serve_streamable_http()
+            elif config.transport == "stdio":
+                await self.serve_stdio()
+            else:
+                raise ValueError(f"Unsupported transport: {config.transport}")
         except KeyboardInterrupt:
             logger.info("Received shutdown signal, cleaning up sessions...")
         except Exception as e:
@@ -2207,6 +2263,40 @@ class SynologyMCPServer:
                 cleanup_results.append(f"{base_url}: Exception - {str(e)}")
 
         return cleanup_results
+
+
+class StreamableHTTPASGIApp:
+    """Small ASGI adapter for the MCP streamable HTTP session manager."""
+
+    def __init__(self, session_manager: StreamableHTTPSessionManager):
+        self.session_manager = session_manager
+
+    async def __call__(self, scope, receive, send) -> None:
+        await self.session_manager.handle_request(scope, receive, send)
+
+
+class QueryTokenProtectedASGIApp:
+    """ASGI wrapper that enforces ?token=... when configured."""
+
+    def __init__(self, app, expected_token: str):
+        self.app = app
+        self.expected_token = expected_token
+
+    async def __call__(self, scope, receive, send) -> None:
+        if scope.get("type") != "http":
+            await self.app(scope, receive, send)
+            return
+
+        query_string = scope.get("query_string", b"")
+        query_params = parse_qs(query_string.decode("utf-8"), keep_blank_values=True)
+        token = query_params.get("token", [None])[0]
+
+        if token is None or not hmac.compare_digest(token, self.expected_token):
+            response = PlainTextResponse("Unauthorized", status_code=401)
+            await response(scope, receive, send)
+            return
+
+        await self.app(scope, receive, send)
 
 
 async def main():

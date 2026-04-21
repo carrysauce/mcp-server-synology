@@ -1,6 +1,6 @@
 # src/config.py - Configuration management
 # Loads all settings from XDG standard config directory (~/.config/synology-mcp/settings.json).
-# Supports multiple NAS, Xiaozhi integration, and server settings.
+# Supports multiple NAS and server settings.
 
 import json
 import logging
@@ -38,11 +38,6 @@ SETTINGS_JSON_EXAMPLE = """
       "note": "Backup NAS"
     }
   },
-  "xiaozhi": {
-    "enabled": false,
-    "token": "your_xiaozhi_token",
-    "endpoint": "wss://api.xiaozhi.me/mcp/"
-  },
   "server": {
     "auto_login": true,
     "verify_ssl": false,
@@ -72,16 +67,44 @@ class SynologyConfig:
         """Load non-sensitive settings from environment / .env."""
         self.server_name = os.getenv("MCP_SERVER_NAME", "synology-mcp-server")
         self.server_version = os.getenv("MCP_SERVER_VERSION", "1.0.0")
-        self.default_session_timeout = int(os.getenv("SESSION_TIMEOUT", "3600"))
+        self.default_session_timeout = self._get_int_env("SESSION_TIMEOUT", 3600)
         self.auto_login = os.getenv("AUTO_LOGIN", "true").lower() == "true"
         self.verify_ssl = os.getenv("VERIFY_SSL", "false").lower() == "true"
         self.debug = os.getenv("DEBUG", "false").lower() == "true"
         self.log_level = os.getenv("LOG_LEVEL", "INFO").upper()
+        self.transport = os.getenv("TRANSPORT", "stdio").strip().lower() or "stdio"
+        self.http_host = os.getenv("HTTP_HOST", "0.0.0.0")
+        self.http_port = self._get_int_env("HTTP_PORT", 8765)
+        self.http_path = self._normalize_http_path(os.getenv("HTTP_PATH", "/mcp"))
+        self.http_query_token = os.getenv("HTTP_QUERY_TOKEN") or None
 
         # Legacy single-NAS env vars (still supported as fallback)
         self.synology_url = os.getenv("SYNOLOGY_URL")
         self.synology_username = os.getenv("SYNOLOGY_USERNAME")
         self.synology_password = os.getenv("SYNOLOGY_PASSWORD")
+
+    @staticmethod
+    def _get_int_env(name: str, default: int) -> int:
+        """Load an integer environment variable with fallback."""
+        value = os.getenv(name)
+        if value is None:
+            return default
+
+        try:
+            return int(value)
+        except ValueError:
+            logger.warning(f"Invalid integer for {name}: {value!r}; using default {default}")
+            return default
+
+    @staticmethod
+    def _normalize_http_path(path: str) -> str:
+        """Normalize the HTTP mount path."""
+        normalized = (path or "/mcp").strip()
+        if not normalized.startswith("/"):
+            normalized = f"/{normalized}"
+        if len(normalized) > 1:
+            normalized = normalized.rstrip("/")
+        return normalized
 
     def _check_file_permissions(self, path: Path) -> bool:
         """Check if secrets file has safe permissions (0600 or stricter).
@@ -112,11 +135,6 @@ class SynologyConfig:
     def _load_settings(self):
         """Load all settings from XDG config directory (~/.config/synology-mcp/settings.json)."""
         self.nas_configs: Dict[str, Dict[str, Any]] = {}
-
-        # Default values for xiaozhi and server settings
-        self.xiaozhi_enabled = False
-        self.xiaozhi_token = ""
-        self.xiaozhi_endpoint = "wss://api.xiaozhi.me/mcp/"
 
         if SETTINGS_FILE.exists():
             # Check file permissions - refuse to load if insecure
@@ -169,15 +187,6 @@ class SynologyConfig:
                         "verify_ssl": self.verify_ssl,
                         "note": nas_info.get("note", ""),
                     }
-
-                # Load Xiaozhi settings
-                xiaozhi_section = data.get("xiaozhi", {})
-                if xiaozhi_section:
-                    self.xiaozhi_enabled = xiaozhi_section.get("enabled", False)
-                    self.xiaozhi_token = xiaozhi_section.get("token", "")
-                    self.xiaozhi_endpoint = xiaozhi_section.get(
-                        "endpoint", "wss://api.xiaozhi.me/mcp/"
-                    )
 
                 # Load server settings (override env vars if present)
                 server_section = data.get("server", {})
@@ -257,14 +266,25 @@ class SynologyConfig:
         """Validate configuration and return list of errors."""
         errors = []
         if not self.has_synology_credentials():
-            errors.append("No Synology credentials found in secrets.json or .env")
+            errors.append("No Synology credentials found in settings.json or .env")
         if self.default_session_timeout < 60:
             errors.append("SESSION_TIMEOUT must be at least 60 seconds")
+        if self.transport not in {"stdio", "http"}:
+            errors.append("TRANSPORT must be either 'stdio' or 'http'")
+        if not self.http_host:
+            errors.append("HTTP_HOST must not be empty")
+        if not 1 <= self.http_port <= 65535:
+            errors.append("HTTP_PORT must be between 1 and 65535")
+        if not self.http_path.startswith("/"):
+            errors.append("HTTP_PATH must start with '/'")
         return errors
 
     def __str__(self) -> str:
         nas_names = ", ".join(self.nas_configs.keys()) if self.nas_configs else "none"
-        return f"SynologyConfig(nas=[{nas_names}], auto_login={self.auto_login})"
+        return (
+            f"SynologyConfig(nas=[{nas_names}], auto_login={self.auto_login}, "
+            f"transport={self.transport})"
+        )
 
 
 # Global config instance
