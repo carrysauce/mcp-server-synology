@@ -2291,7 +2291,14 @@ class QueryTokenProtectedASGIApp:
         query_params = parse_qs(query_string.decode("utf-8"), keep_blank_values=True)
         token = query_params.get("token", [None])[0]
 
-        if token is None or not hmac.compare_digest(token, self.expected_token):
+        if token is None:
+            logger.warning("Rejected HTTP MCP request without query token")
+            response = PlainTextResponse("Unauthorized", status_code=401)
+            await response(scope, receive, send)
+            return
+
+        if not hmac.compare_digest(token, self.expected_token):
+            logger.warning("Rejected HTTP MCP request with invalid query token")
             response = PlainTextResponse("Unauthorized", status_code=401)
             await response(scope, receive, send)
             return

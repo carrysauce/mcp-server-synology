@@ -18,6 +18,10 @@ logger = logging.getLogger("synology-mcp")
 XDG_CONFIG_HOME: Path = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config"))
 CONFIG_DIR = XDG_CONFIG_HOME / "synology-mcp"
 SETTINGS_FILE = CONFIG_DIR / "settings.json"
+DEFAULT_SESSION_TIMEOUT_SECONDS = 3600
+DEFAULT_HTTP_HOST = "0.0.0.0"
+DEFAULT_HTTP_PORT = 8765
+DEFAULT_HTTP_PATH = "/mcp"
 
 # Example settings.json structure for documentation
 SETTINGS_JSON_EXAMPLE = """
@@ -67,15 +71,17 @@ class SynologyConfig:
         """Load non-sensitive settings from environment / .env."""
         self.server_name = os.getenv("MCP_SERVER_NAME", "synology-mcp-server")
         self.server_version = os.getenv("MCP_SERVER_VERSION", "1.0.0")
-        self.default_session_timeout = self._get_int_env("SESSION_TIMEOUT", 3600)
+        self.default_session_timeout = self._get_int_env(
+            "SESSION_TIMEOUT", DEFAULT_SESSION_TIMEOUT_SECONDS
+        )
         self.auto_login = os.getenv("AUTO_LOGIN", "true").lower() == "true"
         self.verify_ssl = os.getenv("VERIFY_SSL", "false").lower() == "true"
         self.debug = os.getenv("DEBUG", "false").lower() == "true"
         self.log_level = os.getenv("LOG_LEVEL", "INFO").upper()
         self.transport = os.getenv("TRANSPORT", "stdio").strip().lower() or "stdio"
-        self.http_host = os.getenv("HTTP_HOST", "0.0.0.0")
-        self.http_port = self._get_int_env("HTTP_PORT", 8765)
-        self.http_path = self._normalize_http_path(os.getenv("HTTP_PATH", "/mcp"))
+        self.http_host = os.getenv("HTTP_HOST", DEFAULT_HTTP_HOST)
+        self.http_port = self._get_int_env("HTTP_PORT", DEFAULT_HTTP_PORT)
+        self.http_path = self._normalize_http_path(os.getenv("HTTP_PATH", DEFAULT_HTTP_PATH))
         self.http_query_token = os.getenv("HTTP_QUERY_TOKEN") or None
 
         # Legacy single-NAS env vars (still supported as fallback)
@@ -99,7 +105,7 @@ class SynologyConfig:
     @staticmethod
     def _normalize_http_path(path: str) -> str:
         """Normalize the HTTP mount path."""
-        normalized = (path or "/mcp").strip()
+        normalized = (path or DEFAULT_HTTP_PATH).strip()
         if not normalized.startswith("/"):
             normalized = f"/{normalized}"
         if len(normalized) > 1:

@@ -161,7 +161,7 @@ class TestSynologyConfig:
         )
 
         errors = cfg.validate_config()
-        assert any("SESSION_TIMEOUT" in error for error in errors)
+        assert any("SESSION_TIMEOUT" in error_msg for error_msg in errors)
 
     def test_validate_config_invalid_transport(self):
         """Test validation fails with an invalid transport value."""
@@ -175,7 +175,7 @@ class TestSynologyConfig:
         )
 
         errors = cfg.validate_config()
-        assert any("TRANSPORT" in error for error in errors)
+        assert any("TRANSPORT" in error_msg for error_msg in errors)
 
     def test_validate_config_invalid_http_port(self):
         """Test validation fails with an out-of-range HTTP port."""
@@ -189,7 +189,7 @@ class TestSynologyConfig:
         )
 
         errors = cfg.validate_config()
-        assert any("HTTP_PORT" in error for error in errors)
+        assert any("HTTP_PORT" in error_msg for error_msg in errors)
 
     def test_missing_required_fields_in_settings(self, tmp_path):
         """Test handling of missing required fields in settings."""
@@ -248,6 +248,7 @@ class TestFilePermissions:
         )
 
         assert cfg.nas_configs == {}
+        assert any(record.levelname == "WARNING" for record in caplog.records)
         assert "overly permissive permissions" in caplog.text
 
 

@@ -40,3 +40,16 @@ def test_query_token_wrapper_rejects_missing_token():
 
     assert response.status_code == 401
     assert response.text == "Unauthorized"
+
+
+def test_query_token_wrapper_rejects_wrong_token():
+    """Query token auth should reject requests with the wrong token."""
+    app = Starlette(
+        routes=[Route("/mcp", endpoint=QueryTokenProtectedASGIApp(PlainTextASGIApp(), "secret"))]
+    )
+
+    with TestClient(app) as client:
+        response = client.get("/mcp?token=wrong")
+
+    assert response.status_code == 401
+    assert response.text == "Unauthorized"
